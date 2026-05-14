@@ -1,5 +1,5 @@
 """
-Cookie Inspector Pro — YOLO11 + Feret Metrology
+Cookie Inspector Pro â€” YOLO11 + Feret Metrology
 A professional-grade desktop inspection tool.
 
 Run:
@@ -74,11 +74,32 @@ class GPIOQuickCaptureTrigger:
     internal pull-up) on a background thread, beeps a buzzer on
     ``GPIO_BUZZER_PIN``, and dispatches the callback onto the Tk main
     thread via ``root.after`` (Tkinter is not thread-safe).
+
+    Press detection:
+        Edge-triggered, not level-triggered. A press only fires on the
+        HIGH -> LOW transition. The loop refuses to fire until it has
+        observed the pin sitting HIGH (i.e. button released) for at
+        least one poll cycle. This prevents a spurious "press" at
+        startup when:
+          * the pin is briefly read LOW before the internal pull-up
+            settles after GPIO.setup, or
+          * the systemd-launched process opens GPIO while the line is
+            transiently floating low from boot.
+        It also means holding the button down on power-on does NOT
+        trigger inspection -- the user must actually release and press.
+
+    Buzzer:
+        Driven as a steady HIGH for ``BEEP_DURATION`` seconds. Correct
+        waveform for an active buzzer (built-in oscillator) -- gets
+        full supply voltage and plays at rated loudness. Beeps run on
+        a dedicated daemon thread so the polling loop and Tk UI never
+        block, lock-guarded so overlapping beeps don't clip each other.
     """
 
-    POLL_INTERVAL  = 0.02   # seconds between reads
-    DEBOUNCE_DELAY = 0.20   # seconds after a press before next is accepted
-    BEEP_DURATION  = 0.10   # seconds the buzzer stays high on press
+    POLL_INTERVAL    = 0.02   # seconds between button reads
+    DEBOUNCE_DELAY   = 0.20   # seconds after a press before next is accepted
+    BEEP_DURATION    = 0.18   # seconds the buzzer stays high per beep
+    STARTUP_SETTLE   = 0.30   # seconds to wait before the loop arms itself
 
     def __init__(self, root, on_press,
                  button_pin=GPIO_BUTTON_PIN,
@@ -90,9 +111,13 @@ class GPIOQuickCaptureTrigger:
         self._stop       = threading.Event()
         self._thread     = None
         self._ok         = False
+        # Serialise beep threads so overlapping calls don't fight over
+        # the pin state (one drops the pin LOW while another is
+        # mid-beep, which would clip the buzz short).
+        self._beep_lock  = threading.Lock()
 
         if not GPIO_AVAILABLE:
-            print("[GPIO] RPi.GPIO not available — hardware trigger disabled.")
+            print("[GPIO] RPi.GPIO not available â€” hardware trigger disabled.")
             return
         try:
             GPIO.setmode(GPIO.BCM)
@@ -101,7 +126,7 @@ class GPIOQuickCaptureTrigger:
             GPIO.output(self._buzzer_pin, GPIO.LOW)
             self._ok = True
         except Exception as e:
-            print(f"[GPIO] setup failed: {e} — hardware trigger disabled.")
+            print(f"[GPIO] setup failed: {e} â€” hardware trigger disabled.")
             self._ok = False
 
     def start(self):
@@ -112,29 +137,89 @@ class GPIOQuickCaptureTrigger:
         self._thread.start()
         print(f"[GPIO] watching pin {self._button_pin} for quick capture.")
 
-    def _beep(self):
-        try:
-            GPIO.output(self._buzzer_pin, GPIO.HIGH)
-            time.sleep(self.BEEP_DURATION)
-            GPIO.output(self._buzzer_pin, GPIO.LOW)
-        except Exception as e:
-            print(f"[GPIO] beep failed: {e}")
+    def _beep_blocking(self):
+        """Actually drive the buzzer. Runs on a dedicated thread so it
+        never holds up the GPIO polling loop or the Tk main loop.
+
+        Lock-guarded so overlapping beep() calls queue up rather than
+        racing each other to drop the pin LOW mid-pulse.
+        """
+        if not self._ok:
+            return
+        with self._beep_lock:
+            try:
+                GPIO.output(self._buzzer_pin, GPIO.HIGH)
+                time.sleep(self.BEEP_DURATION)
+                GPIO.output(self._buzzer_pin, GPIO.LOW)
+            except Exception as e:
+                print(f"[GPIO] beep failed: {e}")
+                try:
+                    GPIO.output(self._buzzer_pin, GPIO.LOW)
+                except Exception:
+                    pass
+
+    def beep(self):
+        """Public, non-blocking buzzer trigger.
+
+        Safe to call from any thread (Tk main loop included): the
+        actual GPIO work runs on a short-lived daemon thread, so the
+        caller returns immediately. No-op if GPIO isn't available.
+
+        Called from ``on_quick_capture`` so that EVERY inspection
+        trigger -- Q hotkey, on-screen QUICK CAPTURE button, hardware
+        GPIO button -- produces an audible beep.
+        """
+        if not self._ok:
+            return
+        threading.Thread(
+            target=self._beep_blocking,
+            name="GPIOBeep", daemon=True).start()
 
     def _run(self):
+        """Button polling loop with edge detection.
+
+        Two startup guards prevent the auto-fire-on-boot problem:
+          1. A short settle delay (``STARTUP_SETTLE``) before the first
+             read, giving the GPIO subsystem time to engage the
+             internal pull-up after ``GPIO.setup``.
+          2. A ``primed`` flag: the loop will not treat a LOW as a
+             press until it has first seen the pin HIGH. So if the
+             line is already LOW when the loop starts (transient or
+             held button), no inspection fires -- the operator must
+             release and re-press for a clean HIGH -> LOW edge.
+        """
+        # Settle: let the pull-up stabilise before we look at the pin.
+        if self._stop.wait(self.STARTUP_SETTLE):
+            return
+
+        # The loop only fires on a HIGH -> LOW edge, and it only arms
+        # itself ('primed') after observing at least one HIGH read.
+        primed    = False
+        last_high = False
+
         while not self._stop.is_set():
             try:
-                if GPIO.input(self._button_pin) == GPIO.LOW:
-                    self._beep()
-                    # Dispatch back to the Tk thread.
+                level = GPIO.input(self._button_pin)
+                if level == GPIO.HIGH:
+                    last_high = True
+                    primed    = True
+                elif primed and last_high and level == GPIO.LOW:
+                    # Clean falling edge -- the button was released and
+                    # is now pressed. Fire the callback.
+                    last_high = False
                     try:
                         self._root.after(0, self._on_press)
                     except Exception:
                         pass
-                    # Debounce: ignore further reads briefly so a single
-                    # press doesn't fire multiple captures.
+                    # Debounce: ignore further reads briefly so a
+                    # single press doesn't fire multiple captures.
                     if self._stop.wait(self.DEBOUNCE_DELAY):
                         break
                     continue
+                else:
+                    # LOW but not yet primed (held at boot, or noise
+                    # before first HIGH). Track it but do not fire.
+                    last_high = False
             except Exception as e:
                 print(f"[GPIO] read failed: {e}")
                 if self._stop.wait(0.5):
@@ -156,9 +241,9 @@ class GPIOQuickCaptureTrigger:
                 print(f"[GPIO] cleanup failed: {e}")
 
 
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Colour palette  (dark industrial / precision)
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 C = {
     "bg":           "#0d0f12",
     "bg2":          "#13161b",
@@ -189,9 +274,9 @@ FONT_MONO   = ("Courier New", 10)
 FONT_LARGE  = ("Courier New", 18, "bold")
 FONT_VALUE  = ("Courier New", 22, "bold")
 
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Config
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Resolved relative to this script's directory so the app finds the
 # weights regardless of the working directory the user launched it from.
 # Layout expected on disk:
@@ -228,7 +313,7 @@ def class_label(cls_id):
     return CLASS_NAMES.get(int(cls_id), f"cls_{int(cls_id)}")
 
 
-# Per-class info — single source of truth for both the marketing
+# Per-class info â€” single source of truth for both the marketing
 # display name AND the production-line spec targets. Each entry:
 #   "full_name":      marketing name used in the walkthrough popup
 #                     dropdown / title.
@@ -282,9 +367,9 @@ def ideal_info(label):
         return (None, None, None)
     return (info["ideal_diameter"], info["ideal_min"], info["ideal_max"])
 
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Persistent settings
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 SETTINGS_PATH = Path.home() / ".cookie_inspector_settings.json"
 
 
@@ -316,13 +401,13 @@ class Settings:
             print(f"[Settings] could not write {SETTINGS_PATH}: {e}")
 
 
-# Global instance — analyze_cookie reads from this rather than a constant
+# Global instance â€” analyze_cookie reads from this rather than a constant
 SETTINGS = Settings()
 
 
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Camera wrapper (picamera2)
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class Camera:
     """
     Thin wrapper around picamera2 that hides start/stop lifecycle
@@ -331,7 +416,7 @@ class Camera:
     Frames returned from `get_frame()` are in BGR order (OpenCV-style),
     matching the rest of the pipeline (cv2.imread, YOLO results, etc.).
 
-    Resolution strategy (tuned for IMX219 — 3280x2464 max):
+    Resolution strategy (tuned for IMX219 â€” 3280x2464 max):
       1. Try the camera's max sensor size (full FOV, full resolution).
       2. If that fails, fall back to a 1920x1080 preview.
       3. If THAT fails, fall back to picamera2's default config.
@@ -425,7 +510,7 @@ class Camera:
             self._running = True
             return
 
-        # Attempt 4: bare default — should always work if camera works at all
+        # Attempt 4: bare default â€” should always work if camera works at all
         print("[Camera] falling back to picamera2 default config")
         config = self._cam.create_preview_configuration()
         self._cam.configure(config)
@@ -459,7 +544,7 @@ class Camera:
         if arr is None:
             return None
         # picamera2 quirk: when configured with format="RGB888", the
-        # numpy array is laid out as BGR (matches OpenCV) — no swap needed.
+        # numpy array is laid out as BGR (matches OpenCV) â€” no swap needed.
         # If we got a 4-channel buffer (XBGR8888 fallback) drop the alpha.
         if arr.ndim == 3 and arr.shape[2] == 4:
             arr = arr[:, :, :3]
@@ -470,9 +555,9 @@ class Camera:
         return self._running
 
 
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Metrology core  (pure logic)
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 def ray_contour_intersections(contour, center, angle_rad):
     cx, cy = center
     dx, dy = math.cos(angle_rad), math.sin(angle_rad)
@@ -585,10 +670,10 @@ def lopsidedness_score(centroid, contour):
     return drift, ratio, (int(mx), int(my)), int(r)
 
 
-# ─────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Texture analysis
-# ─────────────────────────────────────────────
-# LBP parameters — should match across calls so per-cookie scores stay
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# LBP parameters â€” should match across calls so per-cookie scores stay
 # comparable to the batch distribution
 LBP_RADIUS   = 3
 LBP_N_POINTS = 24
@@ -607,8 +692,8 @@ def compute_image_texture(bgr_img):
             -> local mean / variance  -> "roughness" score per pixel
 
     Returns:
-        variance: float32 ndarray (H, W) — texture roughness per pixel
-        hsv:      ndarray (H, W, 3)      — HSV image for color analysis
+        variance: float32 ndarray (H, W) â€” texture roughness per pixel
+        hsv:      ndarray (H, W, 3)      â€” HSV image for color analysis
     Returns (None, None) if scikit-image isn't installed.
     """
     if not SKIMAGE_AVAILABLE:
@@ -639,13 +724,13 @@ def analyze_cookie(mask_coords, raw_mask, variance_map=None, hsv_img=None,
     drift_px, drift_ratio, mec_center, mec_radius = lopsidedness_score(
         (cx, cy), mask_coords)
 
-    # ── Texture & colour stats (only if maps were precomputed) ──
+    # â”€â”€ Texture & colour stats (only if maps were precomputed) â”€â”€
     binary_mask = (raw_mask > 0.5)
     tex = {}
     if variance_map is not None and binary_mask.any():
         # Pull texture-variance values for pixels inside this cookie
         vals = variance_map[binary_mask]
-        # P5/P95 are robust min/max — they ignore single bright crumbs
+        # P5/P95 are robust min/max â€” they ignore single bright crumbs
         tex['tex_values'] = vals
         tex['tex_median'] = float(np.median(vals))
         tex['tex_p5']     = float(np.percentile(vals, 5))
@@ -658,7 +743,7 @@ def analyze_cookie(mask_coords, raw_mask, variance_map=None, hsv_img=None,
         color['hue_median']        = float(np.median(hsv_pixels[:, 0]))
         # New: full per-channel medians + a subsampled HSV pixel cloud
         # for the walkthrough popup's color-region picker. Subsampling
-        # keeps Canvas plotting fast — ~3000 points is plenty to read
+        # keeps Canvas plotting fast â€” ~3000 points is plenty to read
         # the cluster shape and renders in well under a frame on a Pi.
         color['sat_median']        = float(np.median(hsv_pixels[:, 1]))
         color['val_median']        = float(np.median(hsv_pixels[:, 2]))
@@ -669,7 +754,7 @@ def analyze_cookie(mask_coords, raw_mask, variance_map=None, hsv_img=None,
             color['hsv_sample']    = hsv_pixels[sel].astype(np.uint8)
         else:
             color['hsv_sample']    = hsv_pixels.astype(np.uint8)
-        # Average BGR — the "what the camera actually saw" swatch color.
+        # Average BGR â€” the "what the camera actually saw" swatch color.
         # Use the median (per channel) of BGR rather than mean: more
         # robust against specular highlights and edge bleed.
         bgr_pixels = cv2.cvtColor(
@@ -684,8 +769,8 @@ def analyze_cookie(mask_coords, raw_mask, variance_map=None, hsv_img=None,
 
     return {
         'mask':           raw_mask,
-        'cls_id':         cls_id,                          # ← class id from YOLO
-        'label':          class_label(cls_id),             # ← human-readable name
+        'cls_id':         cls_id,                          # â† class id from YOLO
+        'label':          class_label(cls_id),             # â† human-readable name
         'center':         (cx, cy),
         'mec_center':     mec_center,
         'mec_radius':     mec_radius,
@@ -729,7 +814,7 @@ def render_overlays(base_img, cookies, opts):
 
         # Highlight the selected cookie with a non-occluding outline so
         # surface texture stays fully visible. Three layers, drawn outside
-        # → inside, give a "glow" effect:
+        # â†’ inside, give a "glow" effect:
         #   1. soft outer halo on a copy, alpha-blended (no fill on the cookie)
         #   2. a clean accent ring exactly on the cookie boundary
         #   3. a faint reference circle around the enclosing circle
@@ -798,9 +883,9 @@ def render_overlays(base_img, cookies, opts):
     return display
 
 
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Custom Tkinter widgets
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 class FlatButton(tk.Label):
     """Flat styled button using Label for full color control."""
     def __init__(self, parent, text, command=None,
@@ -880,7 +965,7 @@ class RangeSlider(tk.Frame):
     Used in the cookie walkthrough popup to let the user define a custom
     "acceptable hue" range per cookie class. Values snap to integers.
     Fires ``on_change(lo, hi)`` whenever a handle moves (during drag),
-    and ``on_release(lo, hi)`` when the user lets go — handy for cheaper
+    and ``on_release(lo, hi)`` when the user lets go â€” handy for cheaper
     redraws on release vs. live updates.
     """
     H        = 56       # total widget height
@@ -897,7 +982,7 @@ class RangeSlider(tk.Frame):
         # combos when other kwargs are present).
         bg_color = kwargs.pop("bg", C["panel"])
         # Drop any kwargs that would conflict with the underlying Frame
-        # (e.g. width/height — RangeSlider sizes itself via the canvas).
+        # (e.g. width/height â€” RangeSlider sizes itself via the canvas).
         kwargs.pop("width",  None)
         kwargs.pop("height", None)
         super().__init__(parent, bg=bg_color, **kwargs)
@@ -906,7 +991,7 @@ class RangeSlider(tk.Frame):
         self._vmax       = int(vmax)
         self._lo         = int(max(vmin, min(vmax, lo)))
         self._hi         = int(max(self._lo, min(vmax, hi)))
-        # NB: don't call this `self._w` — tk widgets store their internal
+        # NB: don't call this `self._w` â€” tk widgets store their internal
         # tcl path name in `self._w`, so shadowing it produces a cryptic
         # "invalid command name '<int>'" error from cget/configure later.
         self._slider_w   = int(width)
@@ -926,7 +1011,7 @@ class RangeSlider(tk.Frame):
         self._canvas.bind("<ButtonRelease-1>", self._on_release_evt)
         self._redraw()
 
-    # ── public API ──
+    # â”€â”€ public API â”€â”€
     def get(self):
         return (self._lo, self._hi)
 
@@ -942,7 +1027,7 @@ class RangeSlider(tk.Frame):
         self._hi = max(self._lo,   min(self._vmax, self._hi))
         self._redraw()
 
-    # ── coordinate helpers ──
+    # â”€â”€ coordinate helpers â”€â”€
     def _val_to_x(self, v):
         if self._vmax == self._vmin:
             return self.HANDLE_R
@@ -958,7 +1043,7 @@ class RangeSlider(tk.Frame):
             + self._vmin
         return int(round(max(self._vmin, min(self._vmax, v))))
 
-    # ── drawing ──
+    # â”€â”€ drawing â”€â”€
     def _redraw(self):
         c = self._canvas
         c.delete("all")
@@ -998,7 +1083,7 @@ class RangeSlider(tk.Frame):
                       text=str(self._vmax), fill=C["text3"],
                       font=FONT_SMALL)
 
-    # ── mouse handlers ──
+    # â”€â”€ mouse handlers â”€â”€
     def _nearest_handle(self, x):
         d_lo = abs(x - self._val_to_x(self._lo))
         d_hi = abs(x - self._val_to_x(self._hi))
@@ -1151,9 +1236,9 @@ class Slider(tk.Frame):
 class HueStripPicker(tk.Frame):
     """Stacked histogram + draggable rainbow strip for the hue axis.
 
-    Layout (top → bottom):
-      1. Histogram canvas — cyan bars showing the cookie's hue distribution.
-      2. Rainbow strip canvas — solid HSV rainbow with the active band
+    Layout (top â†’ bottom):
+      1. Histogram canvas â€” cyan bars showing the cookie's hue distribution.
+      2. Rainbow strip canvas â€” solid HSV rainbow with the active band
          highlighted in green, two draggable edge handles, and a marker
          for the cookie's median hue.
 
@@ -1196,7 +1281,7 @@ class HueStripPicker(tk.Frame):
                                 cursor=strip_cursor)
         self._strip.pack(fill=tk.X, pady=(2, 0))
 
-        # Pre-render the rainbow once as a PhotoImage — much faster than
+        # Pre-render the rainbow once as a PhotoImage â€” much faster than
         # painting individual lines on every redraw.
         self._rainbow_photo = self._build_rainbow_photo()
         self._strip_drag = None    # 'lo' | 'hi' | 'band' | 'new'
@@ -1213,7 +1298,7 @@ class HueStripPicker(tk.Frame):
 
         self._redraw_strip()
 
-    # ── public API ──
+    # â”€â”€ public API â”€â”€
     def set_band(self, lo, hi, fire=True):
         self._h_lo = int(max(0,   min(179, lo)))
         self._h_hi = int(max(self._h_lo, min(179, hi)))
@@ -1233,7 +1318,7 @@ class HueStripPicker(tk.Frame):
         self._redraw_hist()
         self._redraw_strip()
 
-    # ── helpers ──
+    # â”€â”€ helpers â”€â”€
     def _val_to_x(self, v):
         usable = self._w_px - 2 * self.PAD
         return self.PAD + (v / 179.0) * usable
@@ -1247,7 +1332,7 @@ class HueStripPicker(tk.Frame):
 
     def _build_rainbow_photo(self):
         """Make a PhotoImage of the full HSV rainbow for the strip."""
-        # Build a 1×N RGB array, then upscale to STRIP_H rows with PIL.
+        # Build a 1Ã—N RGB array, then upscale to STRIP_H rows with PIL.
         grad = np.linspace(0, 179, self._w_px).astype(np.uint8)
         hsv  = np.zeros((1, self._w_px, 3), dtype=np.uint8)
         hsv[0, :, 0] = grad
@@ -1258,7 +1343,7 @@ class HueStripPicker(tk.Frame):
             (self._w_px, self.STRIP_H), Image.NEAREST)
         return ImageTk.PhotoImage(pil)
 
-    # ── drawing ──
+    # â”€â”€ drawing â”€â”€
     def _redraw_hist(self):
         c = self._hist
         c.delete("all")
@@ -1292,7 +1377,7 @@ class HueStripPicker(tk.Frame):
         c.create_image(0, 0, image=self._rainbow_photo, anchor="nw")
 
         # In read-only mode the strip is purely an informational
-        # reference — no band, no handles, just the rainbow + cookie
+        # reference â€” no band, no handles, just the rainbow + cookie
         # marker.
         if not self._read_only:
             x_lo = self._val_to_x(self._h_lo)
@@ -1322,7 +1407,7 @@ class HueStripPicker(tk.Frame):
             c.create_line(xm, 0, xm, self.STRIP_H,
                           fill=C["text"], width=1)
 
-    # ── mouse handling ──
+    # â”€â”€ mouse handling â”€â”€
     def _on_press(self, ev):
         x_lo = self._val_to_x(self._h_lo)
         x_hi = self._val_to_x(self._h_hi)
@@ -1336,7 +1421,7 @@ class HueStripPicker(tk.Frame):
             self._drag_start_lo = self._h_lo
             self._drag_start_hi = self._h_hi
         else:
-            # Click outside band — start a new band at this point and
+            # Click outside band â€” start a new band at this point and
             # let the user drag to set the other edge.
             v = self._x_to_val(ev.x)
             self._h_lo = self._h_hi = v
@@ -1376,10 +1461,10 @@ class HueStripPicker(tk.Frame):
 
 
 class SVFieldPicker(tk.Frame):
-    """2D Saturation × Value scatter with a draggable acceptance rectangle.
+    """2D Saturation Ã— Value scatter with a draggable acceptance rectangle.
 
-    The X axis is saturation (0..255, increasing left → right).
-    The Y axis is value (0..255, increasing bottom → top).
+    The X axis is saturation (0..255, increasing left â†’ right).
+    The Y axis is value (0..255, increasing bottom â†’ top).
     Cookie pixels are plotted as small dots; the active rectangle is
     drawn in green; the cookie's (s, v) median is marked.
 
@@ -1425,7 +1510,7 @@ class SVFieldPicker(tk.Frame):
         self._drag_start_rect = (0, 0, 0, 0)
         self._redraw()
 
-    # ── public API ──
+    # â”€â”€ public API â”€â”€
     def set_rect(self, s_lo, s_hi, v_lo, v_hi, fire=True):
         self._s_lo = int(max(0, min(255, s_lo)))
         self._s_hi = int(max(self._s_lo, min(255, s_hi)))
@@ -1448,7 +1533,7 @@ class SVFieldPicker(tk.Frame):
         self._s_hi = int(max(self._s_lo, min(255, s_hi)))
         self._v_lo = int(max(0, min(255, v_lo)))
         self._v_hi = int(max(self._v_lo, min(255, v_hi)))
-        # Rebuild the cached scatter image — expensive, done once per
+        # Rebuild the cached scatter image â€” expensive, done once per
         # cookie. Subsequent drag redraws reuse this and only repaint
         # the lightweight overlay.
         self._scatter_photo = self._build_scatter_photo()
@@ -1481,7 +1566,7 @@ class SVFieldPicker(tk.Frame):
         xs = np.clip(xs, 0, self._w_px - 1)
         ys = np.clip(ys, 0, self._h_px - 1)
         img[ys, xs] = rgb
-        # A second pass with neighbours so the dots look like 2×2 blocks,
+        # A second pass with neighbours so the dots look like 2Ã—2 blocks,
         # otherwise they're too tiny to see comfortably.
         for dy in (0, 1):
             for dx in (0, 1):
@@ -1495,7 +1580,7 @@ class SVFieldPicker(tk.Frame):
         h = h.lstrip("#")
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-    # ── coordinate helpers ──
+    # â”€â”€ coordinate helpers â”€â”€
     def _s_to_x(self, s):
         usable = self._w_px - 2 * self.PAD
         return self.PAD + (s / 255.0) * usable
@@ -1518,7 +1603,7 @@ class SVFieldPicker(tk.Frame):
         return int(round(max(0, min(255,
                     (self._h_px - self.PAD - y) / usable * 255.0))))
 
-    # ── drawing ──
+    # â”€â”€ drawing â”€â”€
     def _redraw(self):
         c = self._canvas
         c.delete("all")
@@ -1530,7 +1615,7 @@ class SVFieldPicker(tk.Frame):
         c.create_text(8, 8, text="^ V", anchor="nw",
                       fill=C["text3"], font=FONT_SMALL)
 
-        # Pixel cloud — pre-rasterized; one blit instead of thousands
+        # Pixel cloud â€” pre-rasterized; one blit instead of thousands
         # of canvas items.
         if self._scatter_photo is not None:
             c.create_image(0, 0, image=self._scatter_photo, anchor="nw")
@@ -1557,7 +1642,7 @@ class SVFieldPicker(tk.Frame):
                           fill=C["green"] if in_box else C["red"],
                           outline=C["text"])
 
-    # ── mouse handling ──
+    # â”€â”€ mouse handling â”€â”€
     def _hit_test(self, x, y):
         x0 = self._s_to_x(self._s_lo); x1 = self._s_to_x(self._s_hi)
         y0 = self._v_to_y(self._v_hi); y1 = self._v_to_y(self._v_lo)
@@ -1656,7 +1741,7 @@ class StatCard(tk.Frame):
         tk.Label(self, text=label.upper(), bg=C["panel"],
                  fg=C["text3"], font=FONT_SMALL).pack(
             anchor=tk.W, padx=10, pady=(8, 0))
-        self._val = tk.Label(self, text="—", bg=C["panel"],
+        self._val = tk.Label(self, text="â€”", bg=C["panel"],
                              fg=color, font=FONT_VALUE)
         self._val.pack(anchor=tk.W, padx=10)
         if unit:
@@ -1668,9 +1753,9 @@ class StatCard(tk.Frame):
         self._val.config(text=str(value))
 
 
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Main Application
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 class CookieInspectorApp:
 
     def __init__(self, root: tk.Tk):
@@ -1702,7 +1787,7 @@ class CookieInspectorApp:
         self.v_through  = tk.BooleanVar(value=True)
         self.v_conf     = tk.DoubleVar(value=DEFAULT_CONF)
 
-        # ── Zoom / pan state ──
+        # â”€â”€ Zoom / pan state â”€â”€
         self._zoom        = 1.0
         self._zoom_min    = 0.1
         self._zoom_max    = 20.0
@@ -1714,14 +1799,14 @@ class CookieInspectorApp:
         self._selected_idx = None       # index of cookie shown in detail panel
         self._detail      = None        # lazily created detail panel widget
 
-        # ── Live camera state ──
+        # â”€â”€ Live camera state â”€â”€
         self._camera        = None       # Camera instance (lazy)
         self._live_mode     = False      # True when displaying live feed
         self._live_after_id = None       # Tk after() handle for the live loop
         self._calibrating   = False      # blocks re-entry of calibrate flow
 
-        # ── Quick-capture state ──
-        # True while the live → snapshot → inspect chain is in progress;
+        # â”€â”€ Quick-capture state â”€â”€
+        # True while the live â†’ snapshot â†’ inspect chain is in progress;
         # prevents re-entry from multiple Q presses.
         self._quick_capture_active = False
         # Set by the Raspberry Pi hardware button path to ask
@@ -1735,7 +1820,7 @@ class CookieInspectorApp:
         # and reset on the next capture.
         self._last_snap_path = None
 
-        # ── Per-cookie walkthrough popup state ──
+        # â”€â”€ Per-cookie walkthrough popup state â”€â”€
         # _wt_win is the Toplevel; _wt_idx is the cookie currently shown.
         self._wt_win   = None
         self._wt_idx   = 0
@@ -1748,18 +1833,18 @@ class CookieInspectorApp:
         # Reset per walkthrough run; persists across BACK/NEXT within
         # one run so re-visiting a cookie shows what you typed.
         self._wt_data = {}                               # {cookie_idx: dict}
-        # Cookie indices the user explicitly SKIPped — excluded from
+        # Cookie indices the user explicitly SKIPped â€” excluded from
         # the JSON output.
         self._wt_skipped = set()
 
-        # ── Texture analysis state ──
+        # â”€â”€ Texture analysis state â”€â”€
         self._variance_map     = None    # image-wide LBP variance map
         self._hsv_img          = None    # HSV version of orig_img
         self._mpl_canvases     = []      # tracked figures in detail panel
         self._tex_mpl_canvases = []      # tracked figures in texture panel
         self._texture_panel    = None    # texture analysis frame
 
-        # ── Busy overlay state ──
+        # â”€â”€ Busy overlay state â”€â”€
         # Centered modal-style Toplevel shown while inspection is
         # running (R / Q / Pi button paths). All three handles must
         # be valid Tk objects when the overlay is up, and all three
@@ -1777,7 +1862,7 @@ class CookieInspectorApp:
         self.root.bind_all("<Key-q>", self._on_quick_capture_hotkey)
         self.root.bind_all("<Key-Q>", self._on_quick_capture_hotkey)
         # Hotkey: 'C' (or 'c') runs the calibration flow against the
-        # current live frame — same behaviour as the (hidden) CALIBRATE
+        # current live frame â€” same behaviour as the (hidden) CALIBRATE
         # button. Suppressed when typing into an Entry/Text widget.
         self.root.bind_all("<Key-c>", self._on_calibrate_hotkey)
         self.root.bind_all("<Key-C>", self._on_calibrate_hotkey)
@@ -1817,13 +1902,13 @@ class CookieInspectorApp:
         # moment the app opens. Defer a moment so the window is mapped
         # and the canvas has its real size before the first frame
         # arrives. If picamera2 isn't installed (dev box), this is a
-        # no-op — _start_live() bails out cleanly.
+        # no-op â€” _start_live() bails out cleanly.
         if PICAMERA_AVAILABLE:
             self.root.after(400, self._start_live)
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # UI Construction
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _build(self):
         # Header
         hdr = tk.Frame(self.root, bg=C["bg2"],
@@ -1844,14 +1929,14 @@ class CookieInspectorApp:
 
         btns = tk.Frame(hdr, bg=C["bg2"])
         btns.pack(side=tk.RIGHT, padx=18, pady=10)
-        # EXPORT button — hidden from the operator UI. Widget is kept so
+        # EXPORT button â€” hidden from the operator UI. Widget is kept so
         # internal code paths that reference btn_save still resolve.
         self.btn_save = FlatButton(btns, "v  EXPORT",
                                    command=self.on_save,
                                    bg=C["bg3"], fg=C["text2"],
                                    font=FONT_SMALL)
         # self.btn_save.pack(...)   # intentionally not packed
-        # RUN INSPECTION — hidden from operator UI. Triggered via the
+        # RUN INSPECTION â€” hidden from operator UI. Triggered via the
         # 'R' hotkey. Widget kept alive because on_run() and the worker
         # callbacks call btn_run.set_state(...).
         self.btn_run = FlatButton(btns, ">  RUN INSPECTION",
@@ -1859,11 +1944,11 @@ class CookieInspectorApp:
                                   bg=C["accent"], fg=C["bg"],
                                   font=("Courier New", 9, "bold"))
         # self.btn_run.pack(...)   # intentionally not packed
-        # ── UPLOAD IMAGE & LIVE buttons ──
+        # â”€â”€ UPLOAD IMAGE & LIVE buttons â”€â”€
         # Hidden from the operator UI (camera-only workflow). Kept as
         # real widget objects so internal references (e.g. _stop_live
         # toggling btn_live's colour, _quick_capture relying on btn_live)
-        # don't break. No .pack() call → invisible.
+        # don't break. No .pack() call â†’ invisible.
         self.btn_upload = FlatButton(btns, "^  UPLOAD IMAGE",
                                      command=self.on_upload,
                                      bg=C["bg3"], fg=C["text"],
@@ -1877,9 +1962,9 @@ class CookieInspectorApp:
         if not PICAMERA_AVAILABLE:
             self.btn_live.set_state(False)
 
-        # ── Quick-capture button ──
+        # â”€â”€ Quick-capture button â”€â”€
         # One-press shortcut: starts live feed, lets exposure settle,
-        # grabs a single frame, stops live, then runs inspection — all
+        # grabs a single frame, stops live, then runs inspection â€” all
         # automatically. Also bound to the 'Q' key (see _bind_hotkeys).
         self.btn_quick = FlatButton(btns, ">>  QUICK CAPTURE  [Q]",
                                     command=self.on_quick_capture,
@@ -1906,15 +1991,15 @@ class CookieInspectorApp:
                                     font=FONT_SMALL)
         self._status_dot.pack(side=tk.LEFT, padx=(12, 4), pady=4)
         self._status_var = tk.StringVar(
-            value="Ready — load a model and upload an image.")
+            value="Ready â€” load a model and upload an image.")
         tk.Label(status_bar, textvariable=self._status_var,
                  bg=C["bg2"], fg=C["text2"],
                  font=FONT_SMALL).pack(side=tk.LEFT)
-        tk.Label(status_bar, text="YOLO11 · Feret Metrology v2",
+        tk.Label(status_bar, text="YOLO11 Â· Feret Metrology v2",
                  bg=C["bg2"], fg=C["text3"],
                  font=FONT_SMALL).pack(side=tk.RIGHT, padx=12)
 
-    # ── Sidebar ──────────────────────────────
+    # â”€â”€ Sidebar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _build_sidebar(self, parent):
         sb = tk.Frame(parent, bg=C["bg2"], width=300,
                       highlightbackground=C["border"],
@@ -1938,36 +2023,36 @@ class CookieInspectorApp:
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(
             iid, width=e.width))
 
-        # ── Model section ──
+        # â”€â”€ Model section â”€â”€
         # Hidden from operator UI. The path is fixed in code via
         # DEFAULT_MODEL_PATH and the model auto-loads on startup; the
         # status label (_model_lbl) is still updated by _load_model_bg
         # but lives in an unpacked frame so the UI stays clean.
         # To re-enable: change `mf` to a child of `inner` and pack it.
-        mf = tk.Frame(self.root, bg=C["bg2"])    # not packed → hidden
+        mf = tk.Frame(self.root, bg=C["bg2"])    # not packed â†’ hidden
         tk.Entry(mf, textvariable=self.model_path).pack()  # keeps var alive
         self._model_lbl = tk.Label(mf, text="* Not loaded",
                                    bg=C["bg2"], fg=C["red"],
                                    font=FONT_SMALL)
         self._model_lbl.pack()
 
-        # ── Inference section ──
+        # â”€â”€ Inference section â”€â”€
         # Hidden from operator UI. The confidence threshold stays at
         # DEFAULT_CONF (v_conf); the slider widget is built into an
         # unpacked frame to keep _conf_lbl alive.
-        inf = tk.Frame(self.root, bg=C["bg2"])    # not packed → hidden
+        inf = tk.Frame(self.root, bg=C["bg2"])    # not packed â†’ hidden
         self._conf_lbl = tk.Label(inf, bg=C["bg2"],
                                   fg=C["accent"], font=FONT_MONO,
                                   text=f"{self.v_conf.get():.2f}")
         self._conf_lbl.pack()
 
-        # ── Calibration section ──
+        # â”€â”€ Calibration section â”€â”€
         # Hidden from operator UI. Calibration runs via the C hotkey
         # (see _bind_hotkeys at end of __init__) which calls
         # on_calibrate() exactly the same way the button did. Label
         # widgets are kept alive because on_calibrate / on_reset
         # update their text, so they need to be valid Tk widgets.
-        cal = tk.Frame(self.root, bg=C["bg2"])   # not packed → hidden
+        cal = tk.Frame(self.root, bg=C["bg2"])   # not packed â†’ hidden
         self._cal_value_lbl = tk.Label(
             cal, bg=C["bg2"], fg=C["accent"], font=FONT_MONO,
             text=f"{SETTINGS.pixel_to_mm:.3f}")
@@ -1984,12 +2069,12 @@ class CookieInspectorApp:
             pad_x=10, pad_y=7)
         self.btn_calibrate.pack()
 
-        # ── Overlay toggles ──
+        # â”€â”€ Overlay toggles â”€â”€
         # Hidden from operator UI. Toggle widgets are built into an
         # unpacked frame so their BooleanVars stay bound (render_overlays
         # still reads them). Toggle the whole overlay layer on/off
         # at runtime with the 'O' hotkey.
-        ov = tk.Frame(self.root, bg=C["bg2"])   # not packed → hidden
+        ov = tk.Frame(self.root, bg=C["bg2"])   # not packed â†’ hidden
         for lbl, var, color in [
             ("YOLO DETECTION",   self.v_yolo,     C["yellow"]),
             ("MASK FILL",        self.v_mask,      C["green"]),
@@ -2009,10 +2094,10 @@ class CookieInspectorApp:
             Toggle(row, variable=var,
                    command=self._refresh_display).pack(side=tk.RIGHT)
 
-        # ── Statistics cards ──
+        # â”€â”€ Statistics cards â”€â”€
         # Hidden from operator UI but built as real widgets because
         # _on_done / _reset_cards write into them.
-        sf = tk.Frame(self.root, bg=C["bg2"])     # not packed → hidden
+        sf = tk.Frame(self.root, bg=C["bg2"])     # not packed â†’ hidden
         self._card_det = StatCard(sf, "Detected", color=C["accent"])
         self._card_det.pack()
         self._card_lop = StatCard(sf, "Lopsided", color=C["red"])
@@ -2027,13 +2112,13 @@ class CookieInspectorApp:
                                   color=C["magenta"])
         self._card_ctr.pack()
 
-        # ── Analysis section ──
+        # â”€â”€ Analysis section â”€â”€
         # Hidden from operator UI. Texture analysis opens via the 'T'
         # hotkey (see _bind_hotkeys at end of __init__). The button and
         # hint widgets are kept alive because other code paths
         # (_show_detail_panel, _hide_detail_panel) update _texture_hint's
         # text, so it needs to be a valid Tk widget.
-        an = tk.Frame(self.root, bg=C["bg2"])    # not packed → hidden
+        an = tk.Frame(self.root, bg=C["bg2"])    # not packed â†’ hidden
         self.btn_texture = FlatButton(
             an, "[T]  TEXTURE  ANALYSIS",
             command=self.on_open_texture,
@@ -2046,10 +2131,10 @@ class CookieInspectorApp:
             text="", justify=tk.LEFT)
         self._texture_hint.pack()
 
-        # ── Results table ──
+        # â”€â”€ Results table â”€â”€
         # Hidden from operator UI but kept alive because
         # _populate_table / _clear_table write into self._tbl.
-        tf = tk.Frame(self.root, bg=C["bg2"])     # not packed → hidden
+        tf = tk.Frame(self.root, bg=C["bg2"])     # not packed â†’ hidden
         self._tbl = tk.Frame(tf, bg=C["bg2"])
         self._tbl.pack()
 
@@ -2061,7 +2146,7 @@ class CookieInspectorApp:
         tk.Frame(row, bg=C["border"], height=1).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
 
-    # ── Canvas area ──────────────────────────
+    # â”€â”€ Canvas area â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _build_canvas(self, parent):
         outer = tk.Frame(parent, bg=C["bg"],
                          highlightbackground=C["border"],
@@ -2078,7 +2163,7 @@ class CookieInspectorApp:
                                   font=FONT_SMALL)
         self._file_lbl.pack(side=tk.LEFT, padx=12, pady=6)
 
-        # ── Zoom controls (right side of toolbar) ──
+        # â”€â”€ Zoom controls (right side of toolbar) â”€â”€
         zoom_frame = tk.Frame(ctool, bg=C["bg2"])
         zoom_frame.pack(side=tk.RIGHT, padx=8, pady=4)
         FlatButton(zoom_frame, "R", command=self._zoom_reset,
@@ -2148,16 +2233,16 @@ class CookieInspectorApp:
             cx, cy+20, text="Upload an image to begin",
             fill=C["text3"], font=("Courier New", 12), tags="ph")
         self._canvas.create_text(
-            cx, cy+44, text="Supports: JPG · PNG · BMP · TIFF",
+            cx, cy+44, text="Supports: JPG Â· PNG Â· BMP Â· TIFF",
             fill=C["text3"], font=FONT_SMALL, tags="ph")
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Model loading
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _load_model_bg(self, path, silent=False):
         def worker():
             try:
-                self._set_status("Loading model…", "yellow")
+                self._set_status("Loading modelâ€¦", "yellow")
                 self.root.after(0, lambda: self._model_lbl.config(
                     text="* Loading...", fg=C["yellow"]))
                 m = YOLO(path)
@@ -2175,7 +2260,7 @@ class CookieInspectorApp:
                 try:
                     friendly = dict(CLASS_NAMES)
                     applied_to = []
-                    # 1. The underlying nn.Module — this is the real source
+                    # 1. The underlying nn.Module â€” this is the real source
                     #    of truth in newer Ultralytics.
                     if hasattr(m, "model") and m.model is not None:
                         try:
@@ -2190,7 +2275,7 @@ class CookieInspectorApp:
                             applied_to.append("m.predictor.model.names")
                         except Exception:
                             pass
-                    # 3. The wrapper itself — may fail on newer versions
+                    # 3. The wrapper itself â€” may fail on newer versions
                     #    (read-only property) and that's fine, it just
                     #    reads from m.model.names which we already set.
                     try:
@@ -2206,7 +2291,7 @@ class CookieInspectorApp:
                     print(f"[Model] could not apply class-name override: {e}")
                 self.model = m
                 self._set_status(
-                    f"Model ready — {os.path.basename(path)}", "green")
+                    f"Model ready â€” {os.path.basename(path)}", "green")
                 self.root.after(0, lambda: self._model_lbl.config(
                     text=f"* {os.path.basename(path)}", fg=C["green"]))
             except Exception as e:
@@ -2227,9 +2312,9 @@ class CookieInspectorApp:
         if p:
             self.model_path.set(p)
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Image upload
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def on_upload(self):
         # Always exit live mode before loading a static image
         if self._live_mode:
@@ -2252,7 +2337,7 @@ class CookieInspectorApp:
         self.last_result  = None
         name = os.path.basename(path)
         self._file_lbl.config(text=name, fg=C["text2"])
-        self._dim_lbl.config(text=f"{img.shape[1]} × {img.shape[0]} px")
+        self._dim_lbl.config(text=f"{img.shape[1]} Ã— {img.shape[0]} px")
         self._clear_table()
         self._reset_cards()
         self._zoom  = 1.0
@@ -2268,29 +2353,29 @@ class CookieInspectorApp:
             "green")
         self._refresh_display()
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Inference
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def on_run(self):
         if self.orig_img is None:
             messagebox.showinfo("No image", "Upload an image first.")
             return
         if self.model is None:
             messagebox.showwarning("No model",
-                                   "Model not loaded — set path and click LOAD.")
+                                   "Model not loaded â€” set path and click LOAD.")
             return
         if self._busy:
             return
         self._busy = True
         self.btn_run.set_state(False)
-        # Centered busy overlay — visible until _on_done (success) or
+        # Centered busy overlay â€” visible until _on_done (success) or
         # the inference worker's error path (failure) tears it down.
         self._show_busy_overlay("Running YOLO inference...")
         threading.Thread(target=self._inference_worker, daemon=True).start()
 
     def _inference_worker(self):
         try:
-            self._set_status("Running YOLO inference…", "yellow")
+            self._set_status("Running YOLO inferenceâ€¦", "yellow")
             # Pass numpy array directly so this works for both uploaded
             # files and live camera frames (no path required).
             results = self.model.predict(
@@ -2303,7 +2388,7 @@ class CookieInspectorApp:
                 return
             r = results[0]
             self.last_result  = r
-            # Force our friendly names onto the result object — Ultralytics
+            # Force our friendly names onto the result object â€” Ultralytics
             # snapshots `names` into Results at predict time, so even if
             # m.names was overridden the result may still hold the old map.
             try:
@@ -2324,7 +2409,7 @@ class CookieInspectorApp:
             else:
                 # Compute the image-wide texture map ONCE so each cookie
                 # only needs to slice into it. This is the expensive step.
-                self._set_status("Analysing texture…", "yellow")
+                self._set_status("Analysing textureâ€¦", "yellow")
                 variance_map, hsv_img = compute_image_texture(self.orig_img)
                 self._variance_map = variance_map
                 self._hsv_img      = hsv_img
@@ -2334,10 +2419,10 @@ class CookieInspectorApp:
                 n = len(r.masks)
                 if fast:
                     self._set_status(
-                        f"Building masks for {n} cookie(s)…", "yellow")
+                        f"Building masks for {n} cookie(s)â€¦", "yellow")
                 else:
                     self._set_status(
-                        f"Computing metrology for {n} mask(s)…", "yellow")
+                        f"Computing metrology for {n} mask(s)â€¦", "yellow")
                 # Pull per-detection class IDs from the YOLO result.
                 # boxes.cls is a tensor aligned with masks (one entry per
                 # detection). If boxes is missing for any reason we fall
@@ -2409,7 +2494,7 @@ class CookieInspectorApp:
             self.root.after(0, lambda: self.btn_run.set_state(True))
 
     def _on_done(self):
-        # Inspection finished successfully — drop the busy overlay
+        # Inspection finished successfully â€” drop the busy overlay
         # before we start populating UI and opening the walkthrough.
         self._hide_busy_overlay()
         n        = len(self.cookies)
@@ -2420,15 +2505,15 @@ class CookieInspectorApp:
         self._card_det.set(str(n))
         self._card_lop.set(str(n_lop))
         self._card_fer.set(
-            f"{sum(ferets)/len(ferets):.1f}"  if ferets  else "—")
+            f"{sum(ferets)/len(ferets):.1f}"  if ferets  else "â€”")
         self._card_mfr.set(
-            f"{sum(minfers)/len(minfers):.1f}" if minfers else "—")
+            f"{sum(minfers)/len(minfers):.1f}" if minfers else "â€”")
         self._card_ctr.set(
-            f"{sum(centers)/len(centers):.1f}" if centers else "—")
+            f"{sum(centers)/len(centers):.1f}" if centers else "â€”")
         self._populate_table()
-        suffix = f"  ·  {n_lop} lopsided" if n_lop else ""
+        suffix = f"  Â·  {n_lop} lopsided" if n_lop else ""
         self._set_status(
-            f"Inspection complete — {n} cookie(s) detected{suffix}", "green")
+            f"Inspection complete â€” {n} cookie(s) detected{suffix}", "green")
         self._refresh_display()
         # Auto-open the per-cookie walkthrough popup if anything was found.
         if n > 0:
@@ -2437,11 +2522,11 @@ class CookieInspectorApp:
     def _reset_cards(self):
         for c in (self._card_det, self._card_lop,
                   self._card_fer, self._card_mfr, self._card_ctr):
-            c.set("—")
+            c.set("â€”")
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Per-cookie walkthrough popup (minimal: diameter + tolerance slider)
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Default texture value applied when a cookie is first viewed.
     # Stored as (lo, hi); slider is now a single value V so lo == hi == V.
     _WT_DEFAULT_TEX = (0, 0)
@@ -2513,7 +2598,7 @@ class CookieInspectorApp:
                 pass
         win.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Inline titlebar — we're no longer a Toplevel so we render our
+        # Inline titlebar â€” we're no longer a Toplevel so we render our
         # own close button in place of the window-manager X.
         titlebar = tk.Frame(win, bg=C["bg3"], height=34)
         titlebar.pack(fill=tk.X)
@@ -2528,7 +2613,7 @@ class CookieInspectorApp:
                    font=("Courier New", 10, "bold"),
                    pad_x=10, pad_y=4).pack(side=tk.RIGHT, padx=4, pady=4)
 
-        # ── Header (cookie name + step counter) ──
+        # â”€â”€ Header (cookie name + step counter) â”€â”€
         hdr = tk.Frame(win, bg=C["bg2"])
         hdr.pack(fill=tk.X, padx=20, pady=(14, 0))
         self._wt_title = tk.Label(hdr, text="",
@@ -2540,7 +2625,7 @@ class CookieInspectorApp:
                                     font=("Courier New", 9))
         self._wt_counter.pack(side=tk.RIGHT, pady=(4, 0))
 
-        # Progress bar — segmented dots reflecting position in walkthrough.
+        # Progress bar â€” segmented dots reflecting position in walkthrough.
         prog_wrap = tk.Frame(win, bg=C["bg2"])
         prog_wrap.pack(fill=tk.X, padx=20, pady=(6, 0))
         self._wt_progress = tk.Canvas(prog_wrap, height=3,
@@ -2552,7 +2637,7 @@ class CookieInspectorApp:
             lambda _e: self._wt_draw_progress(
                 self._wt_idx + 1, max(1, len(self.cookies))))
 
-        # ── Class dropdown directly under the title ──
+        # â”€â”€ Class dropdown directly under the title â”€â”€
         cls_wrap = tk.Frame(win, bg=C["bg2"])
         cls_wrap.pack(fill=tk.X, padx=20, pady=(10, 0))
 
@@ -2560,9 +2645,9 @@ class CookieInspectorApp:
         # (the default "vista" theme on Windows ignores fieldbackground for
         # readonly Combobox state, which makes the field appear bright blue
         # and the text invisible).
-        # The dropdown shows full marketing names (Red Velvet Cookie, …)
+        # The dropdown shows full marketing names (Red Velvet Cookie, â€¦)
         # but the model / JSON / canvas overlay all keep using the short
-        # internal labels (red_velvet, …). Two parallel lists + a
+        # internal labels (red_velvet, â€¦). Two parallel lists + a
         # short<->full lookup keep the conversion centralised.
         self._wt_class_options = [CLASS_NAMES[k]
                                   for k in sorted(CLASS_NAMES.keys())]
@@ -2624,7 +2709,7 @@ class CookieInspectorApp:
         tk.Frame(win, bg=C["separator"], height=1).pack(
             fill=tk.X, padx=0, pady=(18, 0))
 
-        # ── Image card (image on top, slider docked directly below) ──
+        # â”€â”€ Image card (image on top, slider docked directly below) â”€â”€
         img_outer = tk.Frame(win, bg=C["bg2"])
         img_outer.pack(padx=20, pady=(10, 4))
 
@@ -2638,7 +2723,7 @@ class CookieInspectorApp:
         self._wt_img_lbl = tk.Label(img_wrap, bg=C["panel"])
         self._wt_img_lbl.pack(padx=8, pady=(8, 4))
 
-        # Texture slider — single signed value in [-5, +5], integer snap.
+        # Texture slider â€” single signed value in [-5, +5], integer snap.
         # Packed directly beneath the image, inside the same card.
         self._wt_tex_slider = Slider(
             img_wrap, vmin=-5, vmax=5, value=0,
@@ -2651,14 +2736,14 @@ class CookieInspectorApp:
             bg=C["panel"])
         self._wt_tex_slider.pack(padx=8, pady=(0, 6))
 
-        # Correction hint — only visible if the user picks a class
+        # Correction hint â€” only visible if the user picks a class
         # different from the YOLO prediction.
         self._wt_name_lbl = tk.Label(img_outer, text="",
                                      bg=C["bg2"], fg=C["yellow"],
                                      font=("Courier New", 8))
         self._wt_name_lbl.pack(pady=(4, 0))
 
-        # ── Body ──
+        # â”€â”€ Body â”€â”€
         # The frame is created here so its child widgets can be built
         # in the natural reading order, but the actual `body.pack(...)`
         # call is deferred until *after* the button row and footer
@@ -2683,7 +2768,7 @@ class CookieInspectorApp:
         # like "42", decimals like "3.5", and the mid-typing state
         # "3." (so the user can keep typing after the dot). Anything
         # with letters, symbols, more than one dot, or a leading dot is
-        # rejected at the keystroke level — the Entry never displays it.
+        # rejected at the keystroke level â€” the Entry never displays it.
         vcmd = (self.root.register(self._validate_diameter_input), "%P")
         self._wt_diam_entry = tk.Entry(
             diam_row, textvariable=self._wt_diam_var,
@@ -2705,7 +2790,7 @@ class CookieInspectorApp:
                                      font=FONT_SMALL)
         self._wt_skip_lbl.pack(anchor=tk.W, pady=(4, 0))
 
-        # ── Footer separator + button row ──
+        # â”€â”€ Footer separator + button row â”€â”€
         # Packed with side=BOTTOM so they're always anchored to the
         # bottom of the panel. On small displays (Raspberry Pi
         # touchscreens) where the panel can't fit all the content, the
@@ -2734,8 +2819,8 @@ class CookieInspectorApp:
                                        pad_x=10, pad_y=9)
         self._wt_btn_skip.pack(side=tk.LEFT, padx=(6, 0))
 
-        # NEXT packed first with side=RIGHT → rightmost; SAVE packed
-        # after with side=RIGHT → lands to NEXT's left. Final order
+        # NEXT packed first with side=RIGHT â†’ rightmost; SAVE packed
+        # after with side=RIGHT â†’ lands to NEXT's left. Final order
         # left-to-right reads: BACK | SKIP | SAVE | NEXT.
         self._wt_btn_next = FlatButton(btns, "NEXT  >",
                                        command=self._wt_next,
@@ -2756,7 +2841,7 @@ class CookieInspectorApp:
         # Pack the diameter body LAST with side=BOTTOM so it stacks
         # directly above the footer separator + button row. This
         # guarantees the REAL DIAMETER label, entry field, and skip
-        # hint stay visible on small Pi 5 touchscreens — only the
+        # hint stay visible on small Pi 5 touchscreens â€” only the
         # cookie image above will get squeezed if anything.
         body.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(6, 4))
 
@@ -2786,7 +2871,7 @@ class CookieInspectorApp:
                     "tex_hi":        self._WT_DEFAULT_TEX[1]}
             self._wt_data[idx] = data
 
-        # ── Cookie name (title) ──
+        # â”€â”€ Cookie name (title) â”€â”€
         predicted = d.get('label') or "unknown"
         current_name = data["name_override"] or predicted
         # Popup title shows the short label (e.g. "CLASSIC CHOC") so it
@@ -2801,7 +2886,7 @@ class CookieInspectorApp:
         self._wt_counter.config(text=f"STEP  {idx + 1} / {n}")
         self._wt_draw_progress(idx + 1, n)
 
-        # Correction hint — only show when the user has overridden YOLO.
+        # Correction hint â€” only show when the user has overridden YOLO.
         if data["name_override"] and data["name_override"] != predicted:
             self._wt_name_lbl.config(
                 text=f"corrected from "
@@ -2816,20 +2901,20 @@ class CookieInspectorApp:
         if current_name in self._wt_class_options:
             self._wt_class_var.set(self._wt_short_to_full[current_name])
         else:
-            # Predicted label not in our friendly list (e.g. "unknown") —
+            # Predicted label not in our friendly list (e.g. "unknown") â€”
             # leave the combobox blank to indicate "no selection".
             self._wt_class_var.set("")
         self._wt_diam_var.set("" if data["diameter_mm"] is None
                               else str(data["diameter_mm"]))
         # Slider holds a single signed value. For data that was saved with
-        # the old symmetric range, prefer the high end (e.g. (-2, 2) → 2).
+        # the old symmetric range, prefer the high end (e.g. (-2, 2) â†’ 2).
         lo_v, hi_v = int(data["tex_lo"]), int(data["tex_hi"])
         tex_val = hi_v if lo_v == -hi_v else (
             lo_v if lo_v == hi_v else (lo_v + hi_v) // 2)
         self._wt_tex_slider.set_value(tex_val)
         self._wt_suppress_trace = False
 
-        # ── Masked cookie image ──
+        # â”€â”€ Masked cookie image â”€â”€
         photo = self._wt_make_cookie_image(d)
         if photo is not None:
             self._wt_photo = photo  # keep ref so Tk doesn't GC it
@@ -2843,7 +2928,7 @@ class CookieInspectorApp:
         # Skip-state line.
         if idx in self._wt_skipped:
             self._wt_skip_lbl.config(
-                text="This cookie is marked SKIPPED — it won't be saved.")
+                text="This cookie is marked SKIPPED â€” it won't be saved.")
         else:
             self._wt_skip_lbl.config(text="")
 
@@ -2970,10 +3055,10 @@ class CookieInspectorApp:
             try:
                 self._wt_data[idx]["diameter_mm"] = float(raw)
             except ValueError:
-                # User mid-typing ("3" → "3." → "3.5"); leave stored value alone.
+                # User mid-typing ("3" â†’ "3." â†’ "3.5"); leave stored value alone.
                 pass
         # Auto-dismiss the "diameter required" warning as soon as the
-        # user supplies a positive value — they don't need to click
+        # user supplies a positive value â€” they don't need to click
         # NEXT again to see the warning clear.
         if self._wt_current_diameter_valid() and idx not in self._wt_skipped:
             try:
@@ -2993,7 +3078,7 @@ class CookieInspectorApp:
           - digits + "." + digits ("3.5", "10.25")
 
         Rejects letters, symbols, whitespace, more than one decimal
-        point, or a leading dot — the Entry simply ignores those
+        point, or a leading dot â€” the Entry simply ignores those
         keystrokes so the user sees nothing typed.
         """
         if proposed == "":
@@ -3005,7 +3090,7 @@ class CookieInspectorApp:
         stripped = proposed.replace(".", "", 1)
         if not stripped.isdigit():
             return False
-        # Disallow a leading "." like ".5" — user must type "0.5".
+        # Disallow a leading "." like ".5" â€” user must type "0.5".
         if proposed.startswith("."):
             return False
         return True
@@ -3076,7 +3161,7 @@ class CookieInspectorApp:
         """
         idx = self._wt_idx
         self._wt_skipped.add(idx)
-        # Drop the per-cookie entry — won't be saved.
+        # Drop the per-cookie entry â€” won't be saved.
         self._wt_data.pop(idx, None)
         self._set_status(f"Skipped cookie #{idx:02d}.", "yellow")
         if idx < len(self.cookies) - 1:
@@ -3087,7 +3172,7 @@ class CookieInspectorApp:
             self._wt_save()
 
     def _wt_save_partial(self):
-        """SAVE button — finalize the run from the current cookie.
+        """SAVE button â€” finalize the run from the current cookie.
 
         Keeps everything the user has already entered for cookies
         0..current (inclusive) and auto-skips any cookies after the
@@ -3119,7 +3204,7 @@ class CookieInspectorApp:
         consecutive saves don't overwrite each other.
         """
         if not self.cookies:
-            self._set_status("Nothing to save — no cookies.", "red")
+            self._set_status("Nothing to save â€” no cookies.", "red")
             self._close_walkthrough()
             return
 
@@ -3183,7 +3268,7 @@ class CookieInspectorApp:
         if self.orig_img is not None:
             img_h, img_w = self.orig_img.shape[:2]
 
-        # ── Two grouped objects: camera (capture / calibration side)
+        # â”€â”€ Two grouped objects: camera (capture / calibration side)
         # and cookie (inspection / per-cookie side). The top-level
         # only holds file metadata.
         camera_obj = {
@@ -3231,7 +3316,7 @@ class CookieInspectorApp:
         self._set_status(
             f"Saved {len(cookies_out)} cookie(s){skipped_part} "
             f"to {out_path.name}", "green")
-        print(f"[walkthrough] saved → {out_path}")
+        print(f"[walkthrough] saved â†’ {out_path}")
         self._close_walkthrough()
 
     def _close_walkthrough(self):
@@ -3252,9 +3337,9 @@ class CookieInspectorApp:
         self._selected_idx = None
         self._refresh_display()
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Table
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _clear_table(self):
         for w in self._tbl.winfo_children():
             w.destroy()
@@ -3280,9 +3365,9 @@ class CookieInspectorApp:
                          anchor=tk.CENTER, padx=4,
                          pady=5).pack(side=tk.LEFT)
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Display
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _current_frame(self):
         if self.orig_img is None:
             return None
@@ -3320,14 +3405,14 @@ class CookieInspectorApp:
         for i, d in enumerate(self.cookies):
             mask = d.get('mask')
             is_sel = (i == sel)
-            # Highlight only the selected cookie — kept lightweight so
+            # Highlight only the selected cookie â€” kept lightweight so
             # the rest of the cookies stay completely clean.
             if is_sel and mask is not None:
                 mask_u8 = (mask > 0.5).astype(np.uint8) * 255
                 contours, _ = cv2.findContours(
                     mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
                 if contours:
-                    # Pink (BGR) — picks out the active walkthrough
+                    # Pink (BGR) â€” picks out the active walkthrough
                     # cookie against any background. Thick stroke so
                     # it stays readable on small Pi touchscreens.
                     cv2.drawContours(out, contours, -1, (180, 105, 255), 8)
@@ -3381,9 +3466,9 @@ class CookieInspectorApp:
         # Update zoom label
         self._zoom_lbl.config(text=f"{int(self._zoom * 100)}%")
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Zoom helpers
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _zoom_in(self):
         self._apply_zoom(1.25)
 
@@ -3432,9 +3517,9 @@ class CookieInspectorApp:
         self._zoom = new_zoom
         self._refresh_display()
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Mouse-wheel zoom
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _on_mousewheel(self, event):
         # Determine scroll direction (cross-platform)
         if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
@@ -3443,9 +3528,9 @@ class CookieInspectorApp:
             factor = 1 / 1.15
         self._apply_zoom(factor, pivot_x=event.x, pivot_y=event.y)
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Pan (drag)
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Distance (in pixels) the mouse must move during a press to be
     # treated as a drag rather than a click
     CLICK_THRESHOLD = 5
@@ -3479,9 +3564,9 @@ class CookieInspectorApp:
         if not was_drag:
             self._on_canvas_click(event)
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Click-to-inspect
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _canvas_to_image_coords(self, cx_canvas, cy_canvas):
         if self.orig_img is None:
             return None
@@ -3512,7 +3597,7 @@ class CookieInspectorApp:
     def _on_canvas_click(self, event):
         """Clicking a cookie just selects it (updates the canvas
         highlight + makes it the target of the T / S hotkeys). The
-        WITHIN-SPEC detail panel no longer opens on click — press
+        WITHIN-SPEC detail panel no longer opens on click â€” press
         'S' to show it."""
         if not self.cookies:
             return
@@ -3545,9 +3630,9 @@ class CookieInspectorApp:
         idx = self._hit_test(ix, iy)
         self._canvas.config(cursor="hand2" if idx is not None else "crosshair")
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Detail panel
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _show_detail_panel(self, idx):
         d = self.cookies[idx]
         if self._texture_panel is not None and \
@@ -3604,7 +3689,7 @@ class CookieInspectorApp:
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
         self._detail_title = tk.Label(
-            hdr, text="COOKIE #—", bg=C["bg3"], fg=C["accent"],
+            hdr, text="COOKIE #â€”", bg=C["bg3"], fg=C["accent"],
             font=("Courier New", 11, "bold"))
         self._detail_title.pack(side=tk.LEFT, padx=12, pady=8)
         FlatButton(hdr, "X", command=self._hide_detail_panel,
@@ -3701,7 +3786,7 @@ class CookieInspectorApp:
         kv_row("Type", d.get('label', 'unknown').replace("_", " "),
                C["yellow"])
         kv_row("Class ID",
-               str(d['cls_id']) if d.get('cls_id') is not None else "—",
+               str(d['cls_id']) if d.get('cls_id') is not None else "â€”",
                C["text3"])
 
         tk.Frame(self._detail_body, bg=C["border"], height=1).pack(
@@ -3764,9 +3849,9 @@ class CookieInspectorApp:
                  bg=C["panel"], fg=C["text3"], font=FONT_SMALL,
                  justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Texture analysis panel
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def on_open_texture(self):
         if not self.cookies:
             messagebox.showinfo(
@@ -3935,7 +4020,7 @@ class CookieInspectorApp:
 
         if not MPL_AVAILABLE:
             tk.Label(self._tex_body,
-                     text="matplotlib not installed — plots disabled\n"
+                     text="matplotlib not installed â€” plots disabled\n"
                           "    pip install matplotlib",
                      bg=C["panel"], fg=C["text3"],
                      font=FONT_SMALL, justify=tk.LEFT).pack(
@@ -4091,7 +4176,7 @@ class CookieInspectorApp:
 
         status = "in golden range" if in_gold else "OUT of golden range"
         ax.set_xlabel(
-            f"hue (OpenCV HSV) — this cookie {status}",
+            f"hue (OpenCV HSV) â€” this cookie {status}",
             color=marker_color if not in_gold else C["text2"],
             fontsize=8)
         fig.tight_layout(pad=0.3)
@@ -4105,9 +4190,9 @@ class CookieInspectorApp:
         canvas.draw()
         self._tex_mpl_canvases.append(canvas)
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Live camera mode
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def on_toggle_live(self):
         if self._live_mode:
             self._stop_live()
@@ -4138,7 +4223,7 @@ class CookieInspectorApp:
         self.btn_live._bg  = C["red"]
         self.btn_live._dim = FlatButton._darken(C["red"])
         self._file_lbl.config(text="* LIVE FEED", fg=C["red"])
-        self._set_status("Live feed active — press CALIBRATE or RUN INSPECTION",
+        self._set_status("Live feed active â€” press CALIBRATE or RUN INSPECTION",
                          "green")
         self.cookies      = []
         self.yolo_plotted = None
@@ -4184,7 +4269,7 @@ class CookieInspectorApp:
                     self.yolo_plotted = None
                     self.cookies      = []
                 h, w = frame.shape[:2]
-                self._dim_lbl.config(text=f"{w} × {h} px · LIVE")
+                self._dim_lbl.config(text=f"{w} Ã— {h} px Â· LIVE")
                 self._refresh_display()
             else:
                 print("[live] get_frame() returned None")
@@ -4193,21 +4278,21 @@ class CookieInspectorApp:
             traceback.print_exc()
             self._set_status(f"Live error: {e}", "red")
         # Always reschedule while live mode is on.
-        # ~10 FPS at max-res is plenty for inspection (33ms ≈ 30 FPS but
-        # 3280x2464 frames are heavy; 100ms ≈ 10 FPS is realistic).
+        # ~10 FPS at max-res is plenty for inspection (33ms â‰ˆ 30 FPS but
+        # 3280x2464 frames are heavy; 100ms â‰ˆ 10 FPS is realistic).
         if self._live_mode:
             self._live_after_id = self.root.after(100, self._tick_live)
 
-    # ──────────────────────────────────────────
-    # Quick capture — one-press live → snapshot → inspect pipeline
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Quick capture â€” one-press live â†’ snapshot â†’ inspect pipeline
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Number of milliseconds to let the live feed run before grabbing
     # the snapshot. This lets the Pi camera's auto-exposure / auto-WB
     # settle so the first usable frame isn't dark or color-shifted.
     QUICK_CAPTURE_WARMUP_MS = 800
 
     def _on_calibrate_hotkey(self, event):
-        """Keyboard handler for the C hotkey — runs calibration against
+        """Keyboard handler for the C hotkey â€” runs calibration against
         whatever the live feed is currently showing. Same code path as
         the (hidden) CALIBRATE button, just keyboard-triggered.
 
@@ -4219,7 +4304,7 @@ class CookieInspectorApp:
         self.on_calibrate()
 
     def _on_overlays_hotkey(self, event):
-        """Keyboard handler for the O hotkey — toggles the full
+        """Keyboard handler for the O hotkey â€” toggles the full
         diagnostic overlay layer (boxes, masks, feret lines, labels
         with confidence, etc.) on top of the labels-only operator view.
         """
@@ -4233,7 +4318,7 @@ class CookieInspectorApp:
         self._refresh_display()
 
     def _on_texture_hotkey(self, event):
-        """Keyboard handler for the T hotkey — opens texture analysis
+        """Keyboard handler for the T hotkey â€” opens texture analysis
         for the currently-selected cookie. Same code path as the
         (hidden) TEXTURE ANALYSIS button.
         """
@@ -4243,7 +4328,7 @@ class CookieInspectorApp:
         self.on_open_texture()
 
     def _on_run_hotkey(self, event):
-        """Keyboard handler for the R hotkey — runs inspection against
+        """Keyboard handler for the R hotkey â€” runs inspection against
         the current frame. Same code path as the (hidden) RUN
         INSPECTION button.
         """
@@ -4253,7 +4338,7 @@ class CookieInspectorApp:
         self.on_run()
 
     def _on_upload_hotkey(self, event):
-        """Keyboard handler for the U hotkey — opens the upload dialog.
+        """Keyboard handler for the U hotkey â€” opens the upload dialog.
         Same code path as the (hidden) UPLOAD IMAGE button.
         """
         focused = self.root.focus_get()
@@ -4262,7 +4347,7 @@ class CookieInspectorApp:
         self.on_upload()
 
     def _on_spec_hotkey(self, event):
-        """Keyboard handler for the S hotkey — opens the WITHIN-SPEC
+        """Keyboard handler for the S hotkey â€” opens the WITHIN-SPEC
         detail panel for the currently-selected cookie. Same code path
         as the old click-to-show behaviour, just keyboard-triggered.
         Press 'S' again to close it.
@@ -4302,7 +4387,24 @@ class CookieInspectorApp:
         """Hardware-button entry point. Same flow as Q, but flags the
         inference worker to skip texture analysis + per-cookie metrology
         so the Pi 5 spends its cycles on YOLO + walkthrough only.
+
+        On systemd autostart the model loads in a background thread, so
+        a button press during boot can race ahead of self.model being
+        set. Instead of surfacing the modal "No model" popup, wait
+        quietly (up to ~30 s) for the loader to finish, then proceed.
         """
+        if self.model is None:
+            if getattr(self, "_pi_wait_ticks", 0) >= 150:  # 150 * 200ms = 30s
+                self._pi_wait_ticks = 0
+                self._set_status(
+                    "Model still loading â€” press button again shortly.",
+                    "yellow")
+                return
+            self._pi_wait_ticks = getattr(self, "_pi_wait_ticks", 0) + 1
+            self._set_status("Model loading â€” waitingâ€¦", "yellow")
+            self.root.after(200, self._on_pi_button_capture)
+            return
+        self._pi_wait_ticks = 0
         self._fast_inference = True
         self.on_quick_capture()
 
@@ -4314,30 +4416,39 @@ class CookieInspectorApp:
         machine below.
         """
         if self._quick_capture_active:
-            self._set_status("Quick capture already in progress…", "yellow")
+            self._set_status("Quick capture already in progressâ€¦", "yellow")
             return
         if not PICAMERA_AVAILABLE:
             messagebox.showwarning(
                 "Camera unavailable",
-                "picamera2 is not installed — quick capture needs a "
+                "picamera2 is not installed â€” quick capture needs a "
                 "live camera feed.")
             return
         if self.model is None:
             messagebox.showwarning(
                 "No model",
-                "Model not loaded — set path and click LOAD before "
+                "Model not loaded â€” set path and click LOAD before "
                 "using quick capture.")
             return
         if self._busy:
-            self._set_status("Inspection already running — please wait.",
+            self._set_status("Inspection already running â€” please wait.",
                              "yellow")
             return
 
         self._quick_capture_active = True
+        # Audible cue: beep as soon as inspection commits. Wired here
+        # (not only in the GPIO ISR) so every trigger path -- Q hotkey,
+        # on-screen QUICK CAPTURE button, hardware GPIO button -- beeps
+        # the same way. The beep runs on its own thread inside
+        # GPIOQuickCaptureTrigger.beep(), so this call returns instantly.
+        try:
+            self._gpio_trigger.beep()
+        except Exception as e:
+            print(f"[quick] buzzer trigger failed: {e}")
         # Visual cue on the button so the user knows the chain is running.
         self.btn_quick.config(text="...  CAPTURING...")
         self.btn_quick.set_state(False)
-        self._set_status("Quick capture: starting live feed…", "yellow")
+        self._set_status("Quick capture: starting live feedâ€¦", "yellow")
         # Show the centered busy overlay immediately so the user knows
         # the press registered. It will be updated to "running yolo"
         # by on_run() shortly, and torn down by _on_done.
@@ -4388,7 +4499,7 @@ class CookieInspectorApp:
         self.orig_img = frame
         h, w = frame.shape[:2]
         self._file_lbl.config(text="* QUICK SNAPSHOT", fg=C["yellow"])
-        self._dim_lbl.config(text=f"{w} × {h} px · SNAPSHOT")
+        self._dim_lbl.config(text=f"{w} Ã— {h} px Â· SNAPSHOT")
 
         # Persist the captured frame to disk so it can be reviewed
         # later. One file per capture, timestamped to avoid collisions.
@@ -4401,14 +4512,14 @@ class CookieInspectorApp:
             snap_path = out_dir / f"snap_{ts}.jpg"
             if cv2.imwrite(str(snap_path), frame):
                 self._last_snap_path = str(snap_path)
-                print(f"[quick] snapshot saved → {snap_path}")
+                print(f"[quick] snapshot saved â†’ {snap_path}")
             else:
                 print(f"[quick] cv2.imwrite returned False for {snap_path}")
         except Exception as e:
             print(f"[quick] could not save snapshot: {e}")
             traceback.print_exc()
 
-        self._set_status("Quick capture: snapshot taken, stopping live…",
+        self._set_status("Quick capture: snapshot taken, stopping liveâ€¦",
                          "yellow")
         self._stop_live()
         self._refresh_display()
@@ -4416,7 +4527,7 @@ class CookieInspectorApp:
         # Step 4: kick off inspection. on_run() handles its own
         # threading; we hook into its completion via a polling check
         # so we can restore the button when it's done.
-        self._set_status("Quick capture: running inspection…", "yellow")
+        self._set_status("Quick capture: running inspectionâ€¦", "yellow")
         self.on_run()
         # Poll for inspection completion to clear the button state.
         self.root.after(200, self._quick_capture_wait_for_inspection)
@@ -4426,7 +4537,7 @@ class CookieInspectorApp:
         if not self._quick_capture_active:
             return
         if self._busy:
-            # Still running — keep polling.
+            # Still running â€” keep polling.
             self.root.after(200, self._quick_capture_wait_for_inspection)
             return
         # Done.
@@ -4447,21 +4558,21 @@ class CookieInspectorApp:
         # path, so this is a no-op there.
         self._hide_busy_overlay()
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Calibration
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def on_calibrate(self):
         if self._calibrating:
             return
         if self.orig_img is None:
             messagebox.showinfo(
                 "No frame",
-                "Capture a frame first — start LIVE feed or upload an image.")
+                "Capture a frame first â€” start LIVE feed or upload an image.")
             return
         if self.model is None:
             messagebox.showwarning(
                 "No model",
-                "Model not loaded — set path and click LOAD.")
+                "Model not loaded â€” set path and click LOAD.")
             return
         self._calibrating = True
         self.btn_calibrate.set_state(False)
@@ -4471,7 +4582,7 @@ class CookieInspectorApp:
     def _calibration_worker(self):
         try:
             frame = self.orig_img.copy()
-            self._set_status("Calibrating — segmenting cookie…", "yellow")
+            self._set_status("Calibrating â€” segmenting cookieâ€¦", "yellow")
             results = self.model.predict(
                 source=frame,
                 conf=max(0.4, float(self.v_conf.get())),
@@ -4498,7 +4609,7 @@ class CookieInspectorApp:
                     areas.append(cv2.contourArea(mc))
                 best_i = int(np.argmax(areas))
                 mask_inst = r.masks[best_i]
-                msg_extra = (f" ({n} detected — used the largest)")
+                msg_extra = (f" ({n} detected â€” used the largest)")
             else:
                 mask_inst = r.masks[0]
                 msg_extra = ""
@@ -4554,7 +4665,7 @@ class CookieInspectorApp:
         self._cal_value_lbl.config(text=f"{new_ratio:.3f}")
         self._cal_when_lbl.config(text=self._format_calibration_when())
         self._set_status(
-            f"Calibration saved — {new_ratio:.3f} px/mm "
+            f"Calibration saved â€” {new_ratio:.3f} px/mm "
             f"(from {feret_px:.1f} px = {value:.1f} mm)", "green")
 
     def _calibration_failed(self, msg):
@@ -4579,9 +4690,9 @@ class CookieInspectorApp:
             return f"last calibrated  {SETTINGS.calibrated_at}"
         return "factory default (uncalibrated)"
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Save / Export
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def on_save(self):
         img = self._current_frame()
         if img is None:
@@ -4605,10 +4716,10 @@ class CookieInspectorApp:
             messagebox.showerror("Export failed",
                                  f"Cannot write: {path}")
 
-    # ──────────────────────────────────────────
-    # Busy overlay — centered "running" indicator shown during
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Busy overlay â€” centered "running" indicator shown during
     # any inspection trigger (R hotkey / Q hotkey / Pi GPIO button)
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _show_busy_overlay(self, message="Running inspection..."):
         """Display (or update) the centered busy modal.
 
@@ -4722,9 +4833,9 @@ class CookieInspectorApp:
         self._busy_msg_var  = None
         self._busy_dots_var = None
 
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Status helper
-    # ──────────────────────────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _set_status(self, msg, level="green"):
         color = {"green": C["green"],
                  "yellow": C["yellow"],
@@ -4735,9 +4846,9 @@ class CookieInspectorApp:
         ))
 
 
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # Entry point
-# ═════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 def main():
     root = tk.Tk()
     app = CookieInspectorApp(root)
